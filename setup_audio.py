@@ -7,34 +7,38 @@ required_services_units = []
 optional_services_units = []
 
 import pulsectl, warnings
-from pystemd.systemd1 import Unit
-from pystemd.dbuslib import DBus
-from dataclasses import dataclass
+from pystemd.systemd1 import Unit # pyright: ignore[reportMissingImports]
+from pystemd.dbuslib import DBus # pyright: ignore[reportMissingImports]
 
-user_bus = DBus(user_mode=True).__enter__()
-system_bus = DBus(user_mode=False).__enter__()
+with DBus(user_mode=True) as user_bus, DBus(user_mode=False) as system_bus:
+        print("Restarting the audio server...")
 
-print("Restarting the audio server...")
-for service in audio_services: Unit(external_id=service.removesuffix("_system").encode(), bus=system_bus if service.endswith("_system") else user_bus, _autoload=True).Unit.Restart(b"replace")
+        def process(service: str):
+                return {"external_id": service.removesuffix("_system").encode(), "bus": system_bus if service.endswith("_system") else user_bus, "_autoload": True}
 
-pulse = pulsectl.Pulse()
+        for service in audio_services: 
+               Unit(**process(service)).Unit.Restart(b"replace")
 
-for service in required_services:
-        ser = Unit(external_id=service.removesuffix("_system").encode(), bus=system_bus if service.endswith("_system") else user_bus, _autoload=True)
-        if ser.Unit.Description == ser.Unit.Id: raise Exception(f"{service} not installed")
-        required_services_units.append(ser)
-for service in optional_services:
-        ser = Unit(external_id=service.removesuffix("_system").encode(), bus=system_bus if service.endswith("_system") else user_bus, _autoload=True)
-        if ser.Unit.Description == ser.Unit.Id:
-                warnings.warn(f"{service} not installed")
-                optional_services_units.append(None)
-                continue
-        optional_services_units.append(ser)
+        pulse = pulsectl.Pulse()
 
-for service in required_services_units + optional_services_units:
-        if service is not None: service.Unit.Stop(b"replace")
+        for service in required_services:
+                ser = Unit(**process(service))
+                if ser.Unit.Description == ser.Unit.Id: raise Exception(f"{service} not installed")
+                required_services_units.append(ser)
+        for service in optional_services:
+                ser = Unit(**process(service))
+                if ser.Unit.Description == ser.Unit.Id:
+                        warnings.warn(f"{service} not installed")
+                        optional_services_units.append(None)
+                        continue
+                optional_services_units.append(ser)
+
+        for service in required_services_units + optional_services_units:
+                if service is not None: service.Unit.Stop(b"replace")
 
 RATE = 48000
+
+from dataclasses import dataclass
 
 @dataclass
 class SC4_Settings:
@@ -54,23 +58,23 @@ class SC4_Settings:
 class FilterChain:
         filters: list[SC4_Settings]
 
-def get_null_sinks(filters, base): return ["real_"*i + base for i in range(len(filters)+1)]
+def get_null_sinks(filters: list, base: str): return ["real_"*i + base for i in range(len(filters)+1)]
 
-def load_null_sink(name: str, args:str = "", rate: int = RATE): pulse.module_load("module-null-sink", f"sink_name={name} rate={rate} {args}")
+def load_null_sink(name: str, args: str = "", rate: int = RATE): pulse.module_load("module-null-sink", f"sink_name={name} rate={rate} {args}")
 
 def load_filter_chain(filters: FilterChain):
         ns = get_null_sinks(filters.filters, "radio_broadcast")
-        load_null_sink(ns.pop())
+
+        out = ns.pop()
+        load_null_sink(out)
 
         ns.reverse()
-        for i,j in zip(filters.filters, ns):
-                pulse.module_load(i.module, f"rate={RATE} sink_name={j} sink_master={'real_' + j} {str(i)}")
+        for i,j in zip(filters.filters, ns): pulse.module_load(i.module, f"rate={RATE} sink_name={j} sink_master={'real_' + j} {str(i)}")
         sink_name = "radio_broadcast"
         sink_obj = next((s for s in pulse.sink_list() if s.name == sink_name), None)
-        if sink_obj:
-            pulse.default_set(sink_obj)
-        else:
-            print(f"Sink {sink_name} not found!")
+        if sink_obj: pulse.default_set(sink_obj)
+        else: print(f"Sink {sink_name} not found!")
+        return out
 
 
 filter_chain = FilterChain(
@@ -91,29 +95,28 @@ filter_chain = FilterChain(
                         threshold=-12,
                         ratio=6,
                         knee=3,
-                        makeup=12
+                        makeup=9
                 )
         ]
 )
 
-load_filter_chain(filter_chain)
+out = load_filter_chain(filter_chain)
+
+load_null_sink("GTS")
 
 load_null_sink("FM_Audio")
-pulse.module_load("module-loopback", f"sink=FM_Audio source={get_null_sinks(filter_chain.filters, 'radio_broadcast')[-1]}.monitor rate={RATE}")
+pulse.module_load("module-loopback", f"sink=FM_Audio source={out}.monitor rate={RATE}")
 
 load_null_sink("Online_Audio")
-pulse.module_load("module-loopback", f"sink=Online_Audio source=FM_Audio.monitor")
+pulse.module_load("module-loopback", f"sink=Online_Audio source={out}.monitor rate={RATE}")
+pulse.module_load("module-loopback", f"sink=Online_Audio source=GTS.monitor rate={RATE}")
 
-sinks = pulse.sink_list()
-online_audio_sink = None
-for sink in sinks:
-    if sink.name == "Online_Audio":
-        online_audio_sink = sink
-        break
-pulse.volume_set_all_chans(online_audio_sink, 0.5)
+pulse.volume_set_all_chans(next((s for s in pulse.sink_list() if s.name == "Online_Audio"), None), 0.5)
 
 load_null_sink("FM_MPX", "channels=1", 192000)
-load_null_sink("RDS", "channels=4", 4750)
+pulse.module_load("module-loopback", f"sink=FM_MPX source=GTS.monitor rate={RATE}")
+
+load_null_sink("RDS", "channels=2", 4750)
 pulse.module_load("module-native-protocol-tcp", "auth-anonymous=true")
 
 for service in required_services_units + optional_services_units:
