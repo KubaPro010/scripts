@@ -116,7 +116,6 @@ pulse.volume_set_all_chans(next((s for s in pulse.sink_list() if s.name == "Onli
 load_null_sink("FM_MPX", "channels=1", 192000)
 pulse.module_load("module-loopback", f"sink=FM_MPX source=GTS.monitor rate={RATE}")
 
-load_null_sink("RDS", "channels=2", 4750)
 pulse.module_load("module-native-protocol-tcp", "auth-anonymous=true")
 
 for service in required_services_units + optional_services_units:
